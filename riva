@@ -1,191 +1,96 @@
-✅ Sure! Below is a **complete step-by-step script** to **deploy your `.riva` Whisper Turbo model in Riva** and run an inference test (speech-to-text) **in under 10 minutes**.
-
----
-
-## ✅ **1. Install Riva Quickstart & Pull Riva Containers**
-
-Run the following in your terminal (Linux with NVIDIA GPU):
-
-```bash
-# 1. Clone NVIDIA Riva QuickStart repo (if not already)
-git clone https://github.com/nvidia-riva/riva_quickstart
-cd riva_quickstart
-
-# 2. Download Riva initialization script
-bash riva_init.sh
-
-# (This pulls the Riva Speech containers and sets up the directory structure)
-```
-
-You should now have directories like `riva_quickstart/models` and scripts like `riva_start.sh`.
-
----
-
-## ✅ **2. Copy Your Whisper Turbo `.riva` Model**
-
-Put your **`whisper_large_turbo.riva`** file into the `models` folder:
-
-```bash
-cp /path/to/whisper_large_turbo.riva riva_quickstart/models/
-```
-
----
-
-## ✅ **3. Deploy the Riva Server with Your Model**
-
-Start the Riva server with your custom model:
-
-```bash
-# Start the Riva server (loads all .riva models in models/)
-bash riva_start.sh
-```
-
-This will:
-
-* Start Riva Speech Server inside a Docker container.
-* Load your Whisper Turbo `.riva` model (watch the logs to ensure it loads successfully).
-
-You should see logs like:
-
-```
-[INFO] Loading model: whisper_large_turbo.riva
-[INFO] Model successfully loaded.
-Riva server listening on port 50051...
-```
-
----
-
-## ✅ **4. Run an ASR Inference Test (Speech-to-Text)**
-
-Once the server is running, open a **new terminal** (keep the Riva server running) and test an audio file:
-
-```bash
-# Install Riva client package (only needed once)
-pip install nvidia-pip
-pip install nvidia-riva-client
-
-# Run inference (replace with your audio file, 16-bit PCM WAV recommended)
-riva_streaming_asr_client --audio_file sample.wav
-```
-
-You should get output like:
-
-```
-Final Transcript: "This is a test audio transcription using Whisper Turbo."
-```
-
----
-
-## ✅ **5. (Optional) Test with Python Script**
-
-If you prefer a Python client:
-
-```python
-import riva.client
-
-asr_service = riva.client.ASRService(riva.client.Auth(uri="localhost:50051"))
-config = riva.client.RecognitionConfig(language_code="en-US")
-
-for response in asr_service.streaming_response_generator(["sample.wav"], config):
-    for result in response.results:
-        if result.is_final:
-            print("Transcript:", result.alternatives[0].transcript)
-```
-
-Run with:
-
-```bash
-python3 test_asr.py
-```
-
----
-
-## ✅ **6. Stopping the Server**
-
-When done:
-
-```bash
-bash riva_stop.sh
-```
-
-
-
-✅ **Yes, you can absolutely run Riva purely as a Python script and pass pre-recorded audio files (`.wav`, `.mp3`, etc.), even if it’s not real-time audio.**
-
-Riva provides a **Python client SDK** (`nvidia-riva-client`) that lets you connect to the running Riva server and transcribe audio programmatically.
-
----
-
-## ✅ **1. Install Riva Python Client**
-
-```bash
-pip install nvidia-pip
-pip install nvidia-riva-client
-```
-
-*(Ensure your Riva server is already running as described earlier.)*
-
----
-
-## ✅ **2. Python Script for Batch Transcription of .wav Files**
-
-Here’s a **full working Python script** that takes a `.wav` file (or multiple files) and returns the transcription:
-
-```python
-import riva.client
-
-# Connect to Riva server (change localhost if running remotely)
-auth = riva.client.Auth(uri="localhost:50051")
-
-# Create ASR service client
-asr_service = riva.client.ASRService(auth)
-
-# Recognition configuration
-config = riva.client.RecognitionConfig(
-    language_code="en-US",
-    max_alternatives=1,
-    enable_automatic_punctuation=True,
-    verbatim_transcripts=False,
-    audio_channel_count=1,
-    sample_rate_hz=16000,  # Ensure your .wav file is 16kHz mono
-)
-
-def transcribe_audio(audio_file):
-    # Streaming ASR even for pre-recorded files (Riva processes it as a stream)
-    responses = asr_service.streaming_response_generator([audio_file], config)
-    transcript = ""
-    for response in responses:
-        for result in response.results:
-            if result.is_final:
-                transcript += result.alternatives[0].transcript + " "
-    return transcript.strip()
-
-# Test on a single .wav file
-audio_file = "sample.wav"
-print("Transcription:", transcribe_audio(audio_file))
-```
-
----
-
-## ✅ **3. Notes**
-
-* **Audio Format:**
-
-  * Riva expects **16-bit PCM WAV (mono, 16kHz)** for best results.
-  * If your `.wav` isn’t 16kHz mono, you can convert it with FFmpeg:
-
-    ```bash
-    ffmpeg -i input.wav -ar 16000 -ac 1 output.wav
-    ```
-
-* **Batch of Files:**
-  You can call `transcribe_audio()` in a loop over a list of `.wav` files.
-
-* **Other Formats (.mp3, .flac):**
-  Riva ASR officially supports `.wav`. For other formats, convert to `.wav` first (or use FFmpeg in Python).
-
----
-
-## ✅ **4. No Real-Time Requirement**
-
-Even though Riva ASR is optimized for **streaming**, it works perfectly for **offline pre-recorded files** like this. It just streams the file internally chunk by chunk.
+import onnxruntime as ort
+import numpy as np
+import torch
+import torchaudio
+from transformers import WhisperProcessor
+
+# ==============================
+# 1. Load Whisper Processor (Tokenizer + Feature Extractor)
+# ==============================
+model_name = "openai/whisper-large-v3"
+processor = WhisperProcessor.from_pretrained(model_name)
+
+# ==============================
+# 2. TensorRT Providers Configuration
+# ==============================
+providers = [
+    (
+        "TensorrtExecutionProvider",
+        {
+            "trt_engine_cache_enable": True,
+            "trt_engine_cache_path": "./trt_cache",
+            "trt_fp16_enable": True,   # Enable FP16 for speed
+            "trt_int8_enable": False,
+            "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,  # 2GB
+        },
+    ),
+    ("CUDAExecutionProvider", {}),
+    ("CPUExecutionProvider", {}),
+]
+
+# ==============================
+# 3. Load Encoder & Decoder ONNX Sessions
+# ==============================
+encoder_sess = ort.InferenceSession("whisper_encoder.onnx", providers=providers)
+decoder_sess = ort.InferenceSession("whisper_decoder.onnx", providers=providers)
+
+print("Encoder running on:", encoder_sess.get_providers())
+print("Decoder running on:", decoder_sess.get_providers())
+
+# ==============================
+# 4. Preprocess Audio
+# ==============================
+def load_audio(file_path):
+    waveform, sr = torchaudio.load(file_path)
+    if sr != 16000:
+        waveform = torchaudio.functional.resample(waveform, sr, 16000)
+    return waveform.squeeze()
+
+audio_path = "sample.wav"  # <-- Replace with your audio file
+audio = load_audio(audio_path)
+
+# Convert to Whisper's log-mel spectrogram
+inputs = processor(audio, sampling_rate=16000, return_tensors="np")
+mel = inputs.input_features  # shape: (1, 80, T)
+
+# ==============================
+# 5. Run Encoder (TensorRT)
+# ==============================
+encoder_out = encoder_sess.run(None, {"input_features": mel})[0]
+
+# ==============================
+# 6. Greedy Decoding (ONNX Decoder)
+# ==============================
+# Whisper uses autoregressive decoding. For simplicity, we do greedy search.
+# For better accuracy, implement beam search separately.
+
+# Initialize decoder inputs
+decoder_input_ids = np.array([[processor.tokenizer.lang_code_to_id["<|en|>"]]])  # English
+encoder_out_np = encoder_out
+
+max_length = 100
+eos_token_id = processor.tokenizer.eos_token_id
+generated_ids = []
+
+for _ in range(max_length):
+    outputs = decoder_sess.run(
+        None,
+        {
+            "input_ids": decoder_input_ids.astype(np.int64),
+            "encoder_hidden_states": encoder_out_np.astype(np.float32),
+        },
+    )
+    logits = outputs[0][:, -1, :]  # last token logits
+    next_token = np.argmax(logits, axis=-1)
+    generated_ids.append(next_token.item())
+    
+    if next_token == eos_token_id:
+        break
+    
+    decoder_input_ids = np.hstack([decoder_input_ids, next_token.reshape(1, 1)])
+
+# ==============================
+# 7. Decode to Text
+# ==============================
+transcription = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+print("Transcription:", transcription)
