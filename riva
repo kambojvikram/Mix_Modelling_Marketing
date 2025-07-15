@@ -1,6 +1,20 @@
 import onnxruntime as ort
 import numpy as np
 import torch
+
+# Core ONNX + TensorRT support
+pip install onnxruntime-gpu==1.18.0  # Latest stable with TensorRT EP support
+
+# Audio + preprocessing
+pip install torch torchaudio          # For loading audio files
+pip install transformers              # For Whisper processor (tokenizer + feature extractor)
+pip install librosa                   # (Optional) if you want extra audio utilities
+pip install numpy
+
+# Hugging Face utilities (optional, for downloading processor)
+pip install datasets huggingface_hub
+
+
 import torchaudio
 from transformers import WhisperProcessor
 
