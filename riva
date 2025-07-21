@@ -1,110 +1,356 @@
-import onnxruntime as ort
-import numpy as np
+"""
+Attention Weights & Saliency Maps - Complete Implementation
+Shows fastest (attention) vs second fastest (saliency) attribution methods
+"""
+
 import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from transformers import AutoTokenizer, AutoModel, BertTokenizer, BertForSequenceClassification
+from captum.attr import Saliency, IntegratedGradients
+import warnings
+warnings.filterwarnings('ignore')
 
-# Core ONNX + TensorRT support
-pip install onnxruntime-gpu==1.18.0  # Latest stable with TensorRT EP support
+# ============================================================================
+# 1. ATTENTION WEIGHTS (FASTEST METHOD)
+# ============================================================================
 
-# Audio + preprocessing
-pip install torch torchaudio          # For loading audio files
-pip install transformers              # For Whisper processor (tokenizer + feature extractor)
-pip install librosa                   # (Optional) if you want extra audio utilities
-pip install numpy
-
-# Hugging Face utilities (optional, for downloading processor)
-pip install datasets huggingface_hub
-
-
-import torchaudio
-from transformers import WhisperProcessor
-
-# ==============================
-# 1. Load Whisper Processor (Tokenizer + Feature Extractor)
-# ==============================
-model_name = "openai/whisper-large-v3"
-processor = WhisperProcessor.from_pretrained(model_name)
-
-# ==============================
-# 2. TensorRT Providers Configuration
-# ==============================
-providers = [
-    (
-        "TensorrtExecutionProvider",
-        {
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": "./trt_cache",
-            "trt_fp16_enable": True,   # Enable FP16 for speed
-            "trt_int8_enable": False,
-            "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,  # 2GB
-        },
-    ),
-    ("CUDAExecutionProvider", {}),
-    ("CPUExecutionProvider", {}),
-]
-
-# ==============================
-# 3. Load Encoder & Decoder ONNX Sessions
-# ==============================
-encoder_sess = ort.InferenceSession("whisper_encoder.onnx", providers=providers)
-decoder_sess = ort.InferenceSession("whisper_decoder.onnx", providers=providers)
-
-print("Encoder running on:", encoder_sess.get_providers())
-print("Decoder running on:", decoder_sess.get_providers())
-
-# ==============================
-# 4. Preprocess Audio
-# ==============================
-def load_audio(file_path):
-    waveform, sr = torchaudio.load(file_path)
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-    return waveform.squeeze()
-
-audio_path = "sample.wav"  # <-- Replace with your audio file
-audio = load_audio(audio_path)
-
-# Convert to Whisper's log-mel spectrogram
-inputs = processor(audio, sampling_rate=16000, return_tensors="np")
-mel = inputs.input_features  # shape: (1, 80, T)
-
-# ==============================
-# 5. Run Encoder (TensorRT)
-# ==============================
-encoder_out = encoder_sess.run(None, {"input_features": mel})[0]
-
-# ==============================
-# 6. Greedy Decoding (ONNX Decoder)
-# ==============================
-# Whisper uses autoregressive decoding. For simplicity, we do greedy search.
-# For better accuracy, implement beam search separately.
-
-# Initialize decoder inputs
-decoder_input_ids = np.array([[processor.tokenizer.lang_code_to_id["<|en|>"]]])  # English
-encoder_out_np = encoder_out
-
-max_length = 100
-eos_token_id = processor.tokenizer.eos_token_id
-generated_ids = []
-
-for _ in range(max_length):
-    outputs = decoder_sess.run(
-        None,
-        {
-            "input_ids": decoder_input_ids.astype(np.int64),
-            "encoder_hidden_states": encoder_out_np.astype(np.float32),
-        },
-    )
-    logits = outputs[0][:, -1, :]  # last token logits
-    next_token = np.argmax(logits, axis=-1)
-    generated_ids.append(next_token.item())
+class AttentionVisualizer:
+    """Extract and visualize attention weights from transformer models"""
     
-    if next_token == eos_token_id:
-        break
+    def __init__(self, model_name='bert-base-uncased'):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name, output_attentions=True)
+        self.model.eval()
     
-    decoder_input_ids = np.hstack([decoder_input_ids, next_token.reshape(1, 1)])
+    def get_attention_weights(self, text, layer=-1, head=-1):
+        """
+        Extract attention weights (NO BACKWARD PROPAGATION!)
+        
+        Args:
+            text: Input text
+            layer: Which layer to use (-1 for last layer)
+            head: Which attention head to use (-1 for average across heads)
+        
+        Returns:
+            tokens: List of tokens
+            attention_weights: Attention matrix [seq_len, seq_len]
+        """
+        # Tokenize input
+        inputs = self.tokenizer(text, return_tensors='pt', add_special_tokens=True)
+        tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+        
+        # Forward pass only - attention weights computed automatically
+        with torch.no_grad():  # No gradients needed!
+            outputs = self.model(**inputs)
+            attentions = outputs.attentions  # All attention weights
+        
+        # Select specific layer and head
+        attention = attentions[layer][0]  # Remove batch dimension
+        
+        if head == -1:
+            # Average across all heads
+            attention = attention.mean(dim=0)
+        else:
+            attention = attention[head]
+        
+        return tokens, attention.numpy()
+    
+    def get_token_importance(self, text, aggregate='mean'):
+        """
+        Get token importance from attention weights
+        
+        Args:
+            aggregate: How to aggregate attention ('mean', 'max', 'cls')
+        """
+        tokens, attention = self.get_attention_weights(text)
+        
+        if aggregate == 'mean':
+            # Average attention received by each token
+            importance = attention.mean(axis=0)
+        elif aggregate == 'max':
+            # Maximum attention received by each token
+            importance = attention.max(axis=0)
+        elif aggregate == 'cls':
+            # Attention from [CLS] token to other tokens
+            importance = attention[0, :]  # First token is usually [CLS]
+        
+        return tokens, importance
+    
+    def visualize_attention_matrix(self, text, figsize=(10, 8)):
+        """Visualize full attention matrix"""
+        tokens, attention = self.get_attention_weights(text)
+        
+        plt.figure(figsize=figsize)
+        sns.heatmap(attention, 
+                   xticklabels=tokens, 
+                   yticklabels=tokens,
+                   cmap='Blues', 
+                   annot=False,
+                   cbar_kws={'label': 'Attention Weight'})
+        plt.title('Attention Matrix (No Backward Propagation!)')
+        plt.xlabel('Tokens (Attended To)')
+        plt.ylabel('Tokens (Attending From)')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.show()
+    
+    def visualize_token_importance(self, text, figsize=(12, 4)):
+        """Visualize token importance from attention"""
+        tokens, importance = self.get_token_importance(text, aggregate='cls')
+        
+        # Normalize for visualization
+        importance = (importance - importance.min()) / (importance.max() - importance.min())
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        colors = plt.cm.Reds(importance)
+        
+        for i, (token, score) in enumerate(zip(tokens, importance)):
+            ax.text(i, 0, token, ha='center', va='center', 
+                   bbox=dict(boxstyle='round,pad=0.3', 
+                           facecolor=colors[i], 
+                           alpha=0.8),
+                   fontsize=12, fontweight='bold')
+        
+        ax.set_xlim(-0.5, len(tokens)-0.5)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_title('Token Importance from Attention Weights (Fastest Method!)', fontsize=14)
+        ax.axis('off')
+        plt.tight_layout()
+        plt.show()
+        
+        return tokens, importance
 
-# ==============================
-# 7. Decode to Text
-# ==============================
-transcription = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
-print("Transcription:", transcription)
+# ============================================================================
+# 2. SALIENCY MAPS (GRADIENT-BASED METHOD)
+# ============================================================================
+
+class SaliencyVisualizer:
+    """Compute and visualize saliency maps using gradients"""
+    
+    def __init__(self, model_name='textattack/bert-base-uncased-imdb'):
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.model = BertForSequenceClassification.from_pretrained(model_name)
+        self.model.eval()
+        
+        # Initialize Captum's Saliency
+        self.saliency = Saliency(self.model)
+    
+    def predict_sentiment(self, text):
+        """Get model prediction"""
+        inputs = self.tokenizer(text, return_tensors='pt', 
+                               truncation=True, padding=True)
+        
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            probabilities = F.softmax(outputs.logits, dim=-1)
+            prediction = torch.argmax(probabilities, dim=-1)
+        
+        return prediction.item(), probabilities[0].numpy()
+    
+    def compute_saliency(self, text, target_class=None):
+        """
+        Compute saliency map using BACKWARD PROPAGATION
+        
+        Args:
+            text: Input text
+            target_class: Target class for attribution (None for predicted class)
+        
+        Returns:
+            tokens: List of tokens
+            saliency_scores: Saliency scores for each token
+        """
+        # Tokenize
+        inputs = self.tokenizer(text, return_tensors='pt', 
+                               truncation=True, padding=True)
+        
+        # Get tokens for visualization
+        tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+        
+        # Prepare inputs for Captum
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        
+        # Set target class
+        if target_class is None:
+            pred_class, _ = self.predict_sentiment(text)
+            target_class = pred_class
+        
+        def forward_func(input_ids):
+            """Forward function for Captum"""
+            outputs = self.model(input_ids=input_ids, 
+                               attention_mask=attention_mask)
+            return outputs.logits[:, target_class]
+        
+        # Compute saliency using BACKWARD PROPAGATION
+        print("🔄 Computing gradients via backward propagation...")
+        attributions = self.saliency.attribute(
+            input_ids,
+            target=target_class,
+            additional_forward_args=None
+        )
+        
+        # Convert to numpy and get absolute values
+        saliency_scores = attributions[0].detach().numpy()
+        saliency_scores = np.abs(saliency_scores)  # |∂f/∂x_i|
+        
+        return tokens, saliency_scores
+    
+    def visualize_saliency(self, text, target_class=None, figsize=(14, 4)):
+        """Visualize saliency map"""
+        tokens, saliency_scores = self.compute_saliency(text, target_class)
+        
+        # Normalize scores for visualization
+        norm_scores = (saliency_scores - saliency_scores.min()) / \
+                     (saliency_scores.max() - saliency_scores.min())
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        colors = plt.cm.Reds(norm_scores)
+        
+        for i, (token, score) in enumerate(zip(tokens, norm_scores)):
+            # Skip special tokens for cleaner visualization
+            if token in ['[CLS]', '[SEP]', '[PAD]']:
+                continue
+                
+            ax.text(i, 0, token.replace('##', ''), ha='center', va='center',
+                   bbox=dict(boxstyle='round,pad=0.3',
+                           facecolor=colors[i],
+                           alpha=0.8,
+                           edgecolor='black',
+                           linewidth=1),
+                   fontsize=12, fontweight='bold')
+        
+        ax.set_xlim(-0.5, len(tokens)-0.5)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_title('Saliency Map (Uses Backward Propagation)', fontsize=14)
+        ax.axis('off')
+        plt.tight_layout()
+        plt.show()
+        
+        return tokens, saliency_scores
+
+# ============================================================================
+# 3. COMPARISON AND DEMO
+# ============================================================================
+
+def compare_methods():
+    """Compare attention weights vs saliency maps"""
+    
+    # Sample texts
+    texts = [
+        "The movie was absolutely fantastic and amazing!",
+        "This film was terrible and boring.",
+        "The weather today is quite nice and sunny."
+    ]
+    
+    print("=" * 80)
+    print("ATTENTION WEIGHTS vs SALIENCY MAPS COMPARISON")
+    print("=" * 80)
+    
+    # Initialize both methods
+    attention_viz = AttentionVisualizer()
+    saliency_viz = SaliencyVisualizer()
+    
+    for i, text in enumerate(texts[:2]):  # Limit to 2 examples
+        print(f"\n📝 Example {i+1}: {text}")
+        print("-" * 60)
+        
+        # Method 1: Attention Weights (FASTEST)
+        print("🚀 Method 1: Attention Weights (0 additional computation)")
+        import time
+        start_time = time.time()
+        tokens_att, importance_att = attention_viz.get_token_importance(text)
+        att_time = time.time() - start_time
+        print(f"⏱️  Time taken: {att_time:.4f} seconds")
+        
+        # Method 2: Saliency Maps (USES BACKPROP)
+        print("\n🔄 Method 2: Saliency Maps (requires backward propagation)")
+        start_time = time.time()
+        tokens_sal, scores_sal = saliency_viz.compute_saliency(text)
+        sal_time = time.time() - start_time
+        print(f"⏱️  Time taken: {sal_time:.4f} seconds")
+        
+        print(f"\n📊 Speed difference: Saliency is {sal_time/att_time:.1f}x slower")
+        
+        # Visualize both
+        print("\n🎯 Visualizing Attention Weights:")
+        attention_viz.visualize_token_importance(text)
+        
+        print("\n🎯 Visualizing Saliency Map:")
+        saliency_viz.visualize_saliency(text)
+
+def demo_attention_matrix():
+    """Demo full attention matrix visualization"""
+    print("\n" + "=" * 50)
+    print("ATTENTION MATRIX VISUALIZATION")
+    print("=" * 50)
+    
+    text = "The quick brown fox jumps over the lazy dog"
+    attention_viz = AttentionVisualizer()
+    attention_viz.visualize_attention_matrix(text)
+
+def speed_benchmark():
+    """Benchmark different methods"""
+    print("\n" + "=" * 50)
+    print("SPEED BENCHMARK")
+    print("=" * 50)
+    
+    text = "This is a sample sentence for speed testing. " * 10  # Longer text
+    
+    # Attention weights
+    attention_viz = AttentionVisualizer()
+    start = time.time()
+    for _ in range(10):
+        attention_viz.get_token_importance(text)
+    att_time = time.time() - start
+    
+    # Saliency maps
+    saliency_viz = SaliencyVisualizer()
+    start = time.time()
+    for _ in range(10):
+        saliency_viz.compute_saliency(text)
+    sal_time = time.time() - start
+    
+    print(f"🚀 Attention weights (10 runs): {att_time:.4f} seconds")
+    print(f"🔄 Saliency maps (10 runs): {sal_time:.4f} seconds")
+    print(f"📊 Saliency is {sal_time/att_time:.1f}x slower than attention")
+
+# ============================================================================
+# 4. MAIN EXECUTION
+# ============================================================================
+
+if __name__ == "__main__":
+    # Run comprehensive comparison
+    compare_methods()
+    
+    # Demo attention matrix
+    demo_attention_matrix()
+    
+    # Speed benchmark
+    import time
+    speed_benchmark()
+    
+    print("\n" + "=" * 80)
+    print("KEY TAKEAWAYS:")
+    print("=" * 80)
+    print("🚀 Attention Weights:")
+    print("   ✅ FASTEST - No additional computation")
+    print("   ✅ Already computed during forward pass")
+    print("   ❌ Limited to transformer models")
+    print("   ❌ Not true feature attribution")
+    print()
+    print("🔄 Saliency Maps:")
+    print("   ✅ True gradient-based attribution")
+    print("   ✅ Works with any differentiable model")
+    print("   ✅ Theoretically grounded")
+    print("   ❌ Requires backward propagation (slower)")
+    print("   ❌ Can be noisy")
+    print("=" * 80)
+
+# ============================================================================
+# INSTALLATION REQUIREMENTS:
+# pip install torch transformers captum matplotlib seaborn numpy
+# ============================================================================
